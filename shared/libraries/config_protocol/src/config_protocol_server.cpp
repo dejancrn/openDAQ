@@ -82,17 +82,14 @@ ConfigProtocolServer::ConfigProtocolServer(DevicePtr rootDevice,
     , daqContext(this->rootDevice.getContext())
     , notificationReadyCallback(std::move(notificationReadyCallback))
     , deserializer(JsonDeserializer())
-    , notificationSerializer(JsonSerializer())
     , componentFinder(std::make_unique<ComponentFinderRootDevice>(this->rootDevice))
     , user(user)
     , connectionType(connectionType)
     , protocolVersion(0)
     , supportedServerVersions(std::set<uint16_t>({17, 18, 19, 20, 21, 22, 23, 24, 25}))
     , streamingConsumer(this->daqContext, externalSignalsFolder)
-    , packedCoreEvents(List<IBaseObject>())
 {
     assert(user.assigned());
-    notificationSerializer.setUser(user);
 
     buildRpcDispatchStructure();
 
@@ -245,11 +242,10 @@ void ConfigProtocolServer::sendNotification(const BaseObjectPtr& obj)
     StringPtr jsonStr;
     try
     {
-        std::scoped_lock lock(notificationSerializerLock);
-        notificationSerializer.reset();
-        obj.serialize(notificationSerializer);
+        const auto serializer = createSerializer();
+        obj.serialize(serializer);
 
-        jsonStr = notificationSerializer.getOutput();
+        jsonStr = serializer.getOutput();
     }
     catch (const std::exception& e)
     {
@@ -396,9 +392,8 @@ BaseObjectPtr ConfigProtocolServer::callRpc(const StringPtr& name, const ParamsD
     if (it == rpcDispatch.end())
         throw ConfigProtocolException(fmt::format("Invalid function call: {}", name));
 
-    if (protocolVersion < 20)
-        return it->second(params);
-
+    // Core events are bundled per RPC from protocol version 20 on, but for every version the tracker makes sure
+    // the events of the RPC are sent before its reply
     RpcScopeTracker rpcScopeTracker(*this);
     return it->second(params);
 }
@@ -585,10 +580,78 @@ bool ConfigProtocolServer::isForwardedCoreEvent(ComponentPtr& component, CoreEve
     return streamingConsumer.isForwardedCoreEvent(component, eventArgs);
 }
 
+// Queues the event in the place it was reported in. While an RPC runs, from protocol version 20 on, the event is
+// left for a thread that finishes an RPC to serialize, which holds no component locks; otherwise the reporting
+// thread serializes it here, so a thread that holds component locks only ever serializes its own event.
 void ConfigProtocolServer::packCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args)
 {
-    const auto globalId = component.assigned() ? component.getGlobalId() : "";
-    CoreEventArgsPtr packedArgs;
+    PackedCoreEvent* packedEvent;
+    {
+        std::scoped_lock lock(coreEventsLock);
+        packedEvent = &packedCoreEvents.emplace_back();
+        reportedCoreEventCount++;
+    }
+
+    // Must not throw: the place of the event in the queue is released after it
+    const auto logExcludedCoreEvent = [this](const char* reason) noexcept
+    {
+        try
+        {
+            auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
+            LOG_W("A core event was excluded because preparing it failed: {}", reason);
+        }
+        catch (...)
+        {
+        }
+    };
+
+    bool deferred = false;
+    std::string json;
+    try
+    {
+        StringPtr globalId;
+        CoreEventArgsPtr packedArgs;
+        if (prepareCoreEvent(component, args, globalId, packedArgs))
+        {
+            {
+                std::scoped_lock lock(coreEventsLock);
+                if (protocolVersion >= 20 && activeRpcCounter.load(std::memory_order_acquire) > 0)
+                {
+                    packedEvent->globalId = globalId;
+                    packedEvent->args = packedArgs;
+                    packedEvent->state = PackedCoreEvent::State::Deferred;
+                    deferred = true;
+                }
+            }
+            if (!deferred)
+                json = serializeCoreEvent(globalId, packedArgs);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        logExcludedCoreEvent(e.what());
+    }
+    catch (...)
+    {
+        logExcludedCoreEvent("unknown error");
+    }
+
+    if (!deferred)
+    {
+        std::scoped_lock lock(coreEventsLock);
+        packedEvent->json = std::move(json);
+        packedEvent->state = PackedCoreEvent::State::Ready;
+    }
+    coreEventReady.notify_all();
+}
+
+// Converts the event to what is sent for it; returns false if the event is not sent
+bool ConfigProtocolServer::prepareCoreEvent(const ComponentPtr& component,
+                                            const CoreEventArgsPtr& args,
+                                            StringPtr& globalId,
+                                            CoreEventArgsPtr& packedArgs)
+{
+    globalId = component.assigned() ? component.getGlobalId() : "";
 
     switch (static_cast<CoreEventId>(args.getEventId()))
     {
@@ -608,7 +671,7 @@ void ConfigProtocolServer::packCoreEvent(const ComponentPtr& component, const Co
         case CoreEventId::AttributeChanged:
             packedArgs = processAttributeChangedCoreEvent(args);
             if (!packedArgs.assigned())
-                return;
+                return false;
             break;
         case CoreEventId::ComponentRemoved:
         case CoreEventId::SignalDisconnected:
@@ -630,13 +693,39 @@ void ConfigProtocolServer::packCoreEvent(const ComponentPtr& component, const Co
             // Some core events are not serializable e.g. one containing function/procedure property as argument payload, exclude them now so they will not affect other - serializable ones - later
             auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
             LOG_W("Component \"{}\" core event \"{}\" was excluded because parameter \"{}\" cannot be serialized", globalId, packedArgs.getEventName(), parameterKey);
-            return;
+            return false;
         }
     }
-    
-    std::scoped_lock lock(coreEventsLock);
-    packedCoreEvents.pushBack(globalId);
-    packedCoreEvents.pushBack(packedArgs);
+
+    return true;
+}
+
+// Returns the JSON of the two list items a core event is sent as, its global ID and its arguments, or an empty
+// string if serializing them fails
+std::string ConfigProtocolServer::serializeCoreEvent(const StringPtr& globalId, const CoreEventArgsPtr& packedArgs)
+{
+    try
+    {
+        // A list of the two items, written without the envelope a list object has from serializer version 2 on
+        const auto serializer = createSerializer();
+        serializer.startList();
+        globalId.serialize(serializer);
+        packedArgs.serialize(serializer);
+        serializer.endList();
+
+        const std::string list = serializer.getOutput().toStdString();
+        return list.substr(1, list.size() - 2);
+    }
+    catch (const std::exception& e)
+    {
+        auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
+        LOG_W("Component \"{}\" core event \"{}\" was excluded because its serialization failed: {}", globalId, packedArgs.getEventName(), e.what());
+        return {};
+    }
+    catch (...)
+    {
+        return {};
+    }
 }
 
 CoreEventArgsPtr ConfigProtocolServer::processCoreEventArgs(const CoreEventArgsPtr& args)
@@ -680,12 +769,11 @@ CoreEventArgsPtr ConfigProtocolServer::processCoreEventArgs(const CoreEventArgsP
 
 CoreEventArgsPtr ConfigProtocolServer::processUpdateEndCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args)
 {
-    std::scoped_lock lock(notificationSerializerLock);
     auto dict = Dict<IString, IBaseObject>();
 
-    notificationSerializer.reset();
-    component.serialize(notificationSerializer);
-    dict.set("SerializedComponent", notificationSerializer.getOutput());
+    const auto serializer = createSerializer();
+    component.serialize(serializer);
+    dict.set("SerializedComponent", serializer.getOutput());
 
     return CoreEventArgs(static_cast<CoreEventId>(args.getEventId()), args.getEventName(), dict);
 }
@@ -729,24 +817,87 @@ uint16_t ConfigProtocolServer::getProtocolVersion() const
 void ConfigProtocolServer::setProtocolVersion(uint16_t protocolVersion)
 {
     this->protocolVersion = protocolVersion;
-
-    // downgrade serializers
-    if (protocolVersion < 11)
-    {
-        notificationSerializer = createSerializer();
-    }
 }
 
-void ConfigProtocolServer::SendOutCoreEvents()
+// Sends the queued core events from the front of the queue up to the first one that is not serialized yet. The
+// thread that finishes an RPC passes finishingRpc: it first serializes the deferred events and waits for the
+// other events reported so far, so that the events of the RPC are sent before its reply.
+void ConfigProtocolServer::SendOutCoreEvents(bool finishingRpc)
 {
-    std::scoped_lock lock(coreEventsLock);
-    if (packedCoreEvents.getCount() > 0)
+    std::unique_lock lock(coreEventsLock);
+
+    if (finishingRpc)
     {
-        // sendNotification may throw an exception within the tests bcs client code called directly there, so first reset list of accumulated events before sending
-        ListPtr<IBaseObject> packedCoreEventsTmp = packedCoreEvents;
-        packedCoreEvents = List<IBaseObject>();
-        sendNotification(packedCoreEventsTmp);
+        const auto reportedCount = reportedCoreEventCount;
+        for (;;)
+        {
+            std::vector<PackedCoreEvent*> deferredEvents;
+            bool allReady = true;
+            for (size_t i = 0; i < packedCoreEvents.size() && sentCoreEventCount + i < reportedCount; ++i)
+            {
+                auto& packedEvent = packedCoreEvents[i];
+                if (packedEvent.state == PackedCoreEvent::State::Deferred)
+                {
+                    packedEvent.state = PackedCoreEvent::State::Serializing;
+                    deferredEvents.push_back(&packedEvent);
+                }
+                allReady = allReady && packedEvent.state == PackedCoreEvent::State::Ready;
+            }
+
+            if (allReady)
+                break;
+
+            if (deferredEvents.empty())
+            {
+                coreEventReady.wait(lock);
+                continue;
+            }
+
+            lock.unlock();
+            std::vector<std::string> jsons;
+            jsons.reserve(deferredEvents.size());
+            for (auto* packedEvent : deferredEvents)
+            {
+                const auto globalId = std::move(packedEvent->globalId);
+                const auto args = std::move(packedEvent->args);
+                jsons.push_back(serializeCoreEvent(globalId, args));
+            }
+            lock.lock();
+
+            for (size_t i = 0; i < deferredEvents.size(); ++i)
+            {
+                deferredEvents[i]->json = std::move(jsons[i]);
+                deferredEvents[i]->state = PackedCoreEvent::State::Ready;
+            }
+            coreEventReady.notify_all();
+        }
     }
+
+    std::string items;
+    while (!packedCoreEvents.empty() && packedCoreEvents.front().state == PackedCoreEvent::State::Ready)
+    {
+        const auto& json = packedCoreEvents.front().json;
+        if (!json.empty())
+        {
+            if (!items.empty())
+                items += ',';
+            items += json;
+        }
+        // sendNotification may throw an exception within the tests bcs client code called directly there, so first remove the accumulated events before sending
+        packedCoreEvents.pop_front();
+        sentCoreEventCount++;
+    }
+
+    if (items.empty())
+        return;
+
+    // The events are the items of a list object: serialize an empty one and put them inside its brackets
+    const auto serializer = createSerializer();
+    List<IBaseObject>().serialize(serializer);
+    std::string json = serializer.getOutput().toStdString();
+    json.insert(json.rfind(']'), items);
+
+    sendNotification(json.c_str(), json.size());
 }
 
 ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& configServerRef)
@@ -758,7 +909,7 @@ ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& con
 ConfigProtocolServer::RpcScopeTracker::~RpcScopeTracker()
 {
     this->configServerRef.activeRpcCounter.fetch_sub(1, std::memory_order_acq_rel);
-    this->configServerRef.SendOutCoreEvents();
+    this->configServerRef.SendOutCoreEvents(true);
 }
 
 SerializerPtr ConfigProtocolServer::createSerializer()

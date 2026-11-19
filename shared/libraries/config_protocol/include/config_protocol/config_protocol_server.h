@@ -22,6 +22,10 @@
 
 #include <opendaq/component_holder_ptr.h>
 #include <opendaq/client_type.h>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <string>
 
 namespace daq::config_protocol
 {
@@ -107,9 +111,7 @@ private:
     ContextPtr daqContext;
     NotificationReadyCallback notificationReadyCallback;
     DeserializerPtr deserializer;
-    SerializerPtr notificationSerializer;
     std::unordered_map<std::string, DispatchFunction> rpcDispatch;
-    std::mutex notificationSerializerLock;
     std::unique_ptr<IComponentFinder> componentFinder;
     UserPtr user;
     ClientType connectionType;
@@ -117,8 +119,30 @@ private:
     const std::set<uint16_t> supportedServerVersions;
     ConfigProtocolStreamingConsumer streamingConsumer;
     std::atomic<uint64_t> activeRpcCounter{0};
-    ListPtr<IBaseObject> packedCoreEvents;
+
+    // A core event in the queue, in the place it was reported in. A deferred event is serialized by the thread
+    // that finishes an RPC, any other by the thread that reported it. Empty JSON means the event is not sent.
+    struct PackedCoreEvent
+    {
+        enum class State
+        {
+            Serializing,
+            Deferred,
+            Ready
+        };
+
+        State state{State::Serializing};
+        StringPtr globalId;
+        CoreEventArgsPtr args;
+        std::string json;
+    };
+
+    // Guards the queue and its counters; never held while an event is being serialized
     std::mutex coreEventsLock;
+    std::condition_variable coreEventReady;
+    std::deque<PackedCoreEvent> packedCoreEvents;
+    uint64_t reportedCoreEventCount{0};
+    uint64_t sentCoreEventCount{0};
 
     PacketBuffer processPacketAndGetReply(const PacketBuffer& packetBuffer);
     void processNoReplyPacket(const PacketBuffer& packetBuffer);
@@ -146,10 +170,12 @@ private:
     bool isForwardedCoreEvent(ComponentPtr& component, CoreEventArgsPtr& eventArgs);
     
     void packCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args);
+    bool prepareCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args, StringPtr& globalId, CoreEventArgsPtr& packedArgs);
+    std::string serializeCoreEvent(const StringPtr& globalId, const CoreEventArgsPtr& packedArgs);
     CoreEventArgsPtr processCoreEventArgs(const CoreEventArgsPtr& args);
     CoreEventArgsPtr processUpdateEndCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args);
     CoreEventArgsPtr processAttributeChangedCoreEvent(const CoreEventArgsPtr& args);
-    void SendOutCoreEvents();
+    void SendOutCoreEvents(bool finishingRpc = false);
 };
 
 }

@@ -27,6 +27,17 @@
 #include <opendaq/logger_sink_factory.h>
 #include <opendaq/logger_sink_last_message_private_ptr.h>
 #include <coreobjects/property_object_class_factory.h>
+#include <coreobjects/core_event_args_factory.h>
+#include <coretypes/event_ptr.h>
+#include <coretypes/intfs.h>
+#include <coretypes/serializable.h>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <string>
+#include <thread>
 
 using namespace daq;
 using namespace daq::config_protocol;
@@ -91,9 +102,17 @@ protected:
     //To simulate disconnected server - notifications from server are dropped
     bool disconnected = false;
 
+    // When set, receives the server notifications instead of the client
+    std::function<void(const PacketBuffer&)> notificationHook;
+
     // server handling
     void serverNotificationReady(const PacketBuffer& notificationPacket) const
     {
+        if (notificationHook)
+        {
+            notificationHook(notificationPacket);
+            return;
+        }
         if (disconnected)
             return;
         client->triggerNotificationPacket(notificationPacket);
@@ -2093,4 +2112,218 @@ TEST_F(ConfigCoreEventTest, DeviceLockUnlock)
     ASSERT_FALSE(clSubDev.isLocked());
 
     ASSERT_EQ(callCount, 2);
+}
+
+// Runs the function when the test leaves its scope, also after a failed assertion or an exception
+struct OnExit
+{
+    std::function<void()> function;
+
+    ~OnExit()
+    {
+        function();
+    }
+};
+
+// Calls a function when it is serialized, and serializes as a marker string
+class NotifyingSerializable : public ImplementationOf<ISerializable>
+{
+public:
+    static constexpr const char* Marker = "notifying serializable";
+
+    explicit NotifyingSerializable(std::function<void()> onSerialize)
+        : onSerialize(std::move(onSerialize))
+    {
+    }
+
+    ErrCode INTERFACE_FUNC serialize(ISerializer* serializer) override
+    {
+        onSerialize();
+        return serializer->writeString(Marker, std::char_traits<char>::length(Marker));
+    }
+
+    ErrCode INTERFACE_FUNC getSerializeId(ConstCharPtr* id) const override
+    {
+        *id = "NotifyingSerializable";
+        return OPENDAQ_SUCCESS;
+    }
+
+private:
+    std::function<void()> onSerialize;
+};
+
+// Reports a core event of the component that carries the given object, on the calling thread
+static void reportCoreEventWith(const DevicePtr& device, const ComponentPtr& component, const ObjectPtr<ISerializable>& object)
+{
+    EventPtr<const ComponentPtr, const CoreEventArgsPtr> coreEvent;
+    checkErrorInfo(device.getContext()->getOnCoreEvent(&coreEvent));
+
+    const CoreEventArgsPtr args =
+        CoreEventArgs(CoreEventId::StatusChanged, "StatusChanged", Dict<IString, IBaseObject>({{"Object", object}}));
+    coreEvent(component, args);
+}
+
+// The serialization of the first event waits, as it would for a component lock, until the second is reported
+TEST_F(ConfigCoreEventTest, CoreEventReportedWhileAnotherThreadIsSerializing)
+{
+    using namespace std::chrono_literals;
+
+    std::promise<void> serializeStarted;
+    std::promise<void> secondEventReported;
+    auto secondEventReportedFuture = secondEventReported.get_future();
+    std::atomic<int> serializeCount{0};
+    std::atomic<bool> reportedWhileSerializing{false};
+
+    std::mutex sentLock;
+    std::string sent;
+    OnExit clearHook{[this] { notificationHook = nullptr; }};
+    notificationHook = [&](const PacketBuffer& packet)
+    {
+        std::scoped_lock lock(sentLock);
+        sent += packet.parseServerNotification().toStdString();
+    };
+
+    const auto object = createWithImplementation<ISerializable, NotifyingSerializable>(
+        [&]
+        {
+            if (serializeCount++ == 0)
+            {
+                serializeStarted.set_value();
+                reportedWhileSerializing = secondEventReportedFuture.wait_for(5s) == std::future_status::ready;
+            }
+        });
+
+    const auto firstComponent = serverDevice.findComponent("IO/AI/Ch");
+    const auto secondComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+    const std::string secondMarker = "reported while serializing";
+
+    std::thread reporter([&] { reportCoreEventWith(serverDevice, firstComponent, object); });
+    OnExit joinReporter{[&] { if (reporter.joinable()) reporter.join(); }};
+
+    const bool started = serializeStarted.get_future().wait_for(10s) == std::future_status::ready;
+    if (started)
+        secondComponent.setDescription(secondMarker);
+    secondEventReported.set_value();
+    reporter.join();
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(reportedWhileSerializing);
+
+    // Sent in the order reported
+    const auto firstPos = sent.find(NotifyingSerializable::Marker);
+    const auto secondPos = sent.find(secondMarker);
+    ASSERT_NE(firstPos, std::string::npos);
+    ASSERT_NE(secondPos, std::string::npos);
+    ASSERT_LT(firstPos, secondPos);
+}
+
+// Runs an RPC while another thread is still serializing a core event it reported before, and returns whether
+// the event of the RPC had been sent when the RPC returned
+static bool rpcEventSentBeforeReply(std::function<void(const PacketBuffer&)>& notificationHook,
+                                    const DevicePtr& serverDevice,
+                                    const ComponentPtr& clientComponent)
+{
+    using namespace std::chrono_literals;
+
+    std::promise<void> serializeStarted;
+    std::atomic<int> serializeCount{0};
+
+    std::mutex sentLock;
+    std::string sent;
+    OnExit clearHook{[&] { notificationHook = nullptr; }};
+    notificationHook = [&](const PacketBuffer& packet)
+    {
+        std::scoped_lock lock(sentLock);
+        sent += packet.parseServerNotification().toStdString();
+    };
+
+    const auto object = createWithImplementation<ISerializable, NotifyingSerializable>(
+        [&]
+        {
+            if (serializeCount++ == 0)
+            {
+                serializeStarted.set_value();
+                std::this_thread::sleep_for(500ms);
+            }
+        });
+
+    const auto serverComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+    std::thread reporter([&] { reportCoreEventWith(serverDevice, serverComponent, object); });
+    OnExit joinReporter{[&] { if (reporter.joinable()) reporter.join(); }};
+
+    const std::string rpcMarker = "set by the rpc";
+    bool sentBeforeReply = false;
+    if (serializeStarted.get_future().wait_for(10s) == std::future_status::ready)
+    {
+        clientComponent.setPropertyValue("StrProp", rpcMarker);
+
+        std::scoped_lock lock(sentLock);
+        sentBeforeReply = sent.find(rpcMarker) != std::string::npos;
+    }
+    reporter.join();
+
+    return sentBeforeReply;
+}
+
+TEST_F(ConfigCoreEventTest, RpcSendsItsCoreEventsBeforeReplyWhileAnotherThreadIsSerializing)
+{
+    const auto clientComponent = client->getDevice().findComponent("IO/AI/Ch");
+
+    ASSERT_TRUE(rpcEventSentBeforeReply(notificationHook, serverDevice, clientComponent));
+}
+
+// Before protocol version 20 the events are not bundled per RPC, but they are still sent before the reply
+TEST_F(ConfigCoreEventTest, RpcSendsItsCoreEventsBeforeReplyWhileAnotherThreadIsSerializingOldProtocol)
+{
+    const auto clientComponent = client->getDevice().findComponent("IO/AI/Ch");
+
+    server->setProtocolVersion(19);
+
+    ASSERT_TRUE(rpcEventSentBeforeReply(notificationHook, serverDevice, clientComponent));
+}
+
+// The event is reported by another thread while the RPC runs, and serialized by the thread of the RPC
+TEST_F(ConfigCoreEventTest, CoreEventReportedDuringRpcIsSerializedByThreadFinishingRpc)
+{
+    std::atomic<int> serializeCount{0};
+    std::thread::id serializedBy;
+    std::thread::id reportedBy;
+
+    OnExit clearHook{[this] { notificationHook = nullptr; }};
+    notificationHook = [](const PacketBuffer& /*packet*/) {};
+
+    const auto object = createWithImplementation<ISerializable, NotifyingSerializable>(
+        [&]
+        {
+            serializeCount++;
+            serializedBy = std::this_thread::get_id();
+        });
+
+    const auto serverComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+    const auto clientComponent = client->getDevice().findComponent("IO/AI/Ch");
+
+    // Reports the event from another thread while the RPC that sets the property runs
+    const auto active = std::make_shared<std::atomic<bool>>(true);
+    OnExit deactivate{[active] { *active = false; }};
+    std::atomic<bool> reported{false};
+    serverDevice.getContext().getOnCoreEvent() += [&, active](const ComponentPtr& /*comp*/, const CoreEventArgsPtr& args)
+    {
+        if (!*active || args.getEventId() != static_cast<Int>(CoreEventId::PropertyValueChanged) || reported.exchange(true))
+            return;
+
+        std::thread reporter(
+            [&]
+            {
+                reportedBy = std::this_thread::get_id();
+                reportCoreEventWith(serverDevice, serverComponent, object);
+            });
+        reporter.join();
+    };
+
+    clientComponent.setPropertyValue("StrProp", "foo");
+
+    ASSERT_TRUE(reported);
+    ASSERT_EQ(serializeCount, 1);
+    ASSERT_NE(reportedBy, std::this_thread::get_id());
+    ASSERT_EQ(serializedBy, std::this_thread::get_id());
 }
