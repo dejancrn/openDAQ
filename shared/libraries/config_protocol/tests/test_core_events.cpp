@@ -29,6 +29,7 @@
 #include <coreobjects/property_object_class_factory.h>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <thread>
 
@@ -95,9 +96,17 @@ protected:
     //To simulate disconnected server - notifications from server are dropped
     bool disconnected = false;
 
+    // When set, receives the server notifications instead of the client
+    std::function<void(const PacketBuffer&)> notificationHook;
+
     // server handling
     void serverNotificationReady(const PacketBuffer& notificationPacket) const
     {
+        if (notificationHook)
+        {
+            notificationHook(notificationPacket);
+            return;
+        }
         if (disconnected)
             return;
         client->triggerNotificationPacket(notificationPacket);
@@ -2139,4 +2148,42 @@ TEST_F(ConfigCoreEventTest, CoreEventReportedWhileAnotherThreadIsSending)
     ASSERT_TRUE(started);
     ASSERT_TRUE(reportedWhileSending);
     ASSERT_EQ(sendCount, 2);
+}
+
+// The events an RPC causes are sent before its reply, also when another thread is sending at that moment
+TEST_F(ConfigCoreEventTest, RpcSendsItsCoreEventsBeforeReplyWhileAnotherThreadIsSending)
+{
+    using namespace std::chrono_literals;
+
+    std::promise<void> sendStarted;
+    std::atomic<int> sendsStarted{0};
+    std::atomic<int> sendsFinished{0};
+
+    notificationHook = [&](const PacketBuffer& /*packet*/)
+    {
+        if (sendsStarted++ == 0)
+        {
+            sendStarted.set_value();
+            std::this_thread::sleep_for(500ms);
+        }
+        sendsFinished++;
+    };
+
+    const auto serverComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+    const auto clientComponent = client->getDevice().findComponent("IO/AI/Ch");
+
+    std::thread sender([&] { serverComponent.setDescription("sent by another thread"); });
+
+    const bool started = sendStarted.get_future().wait_for(10s) == std::future_status::ready;
+    int sentBeforeReply = -1;
+    if (started)
+    {
+        clientComponent.setPropertyValue("StrProp", "foo");
+        sentBeforeReply = sendsFinished;
+    }
+    sender.join();
+    notificationHook = nullptr;
+
+    ASSERT_TRUE(started);
+    ASSERT_GE(sentBeforeReply, 2);
 }

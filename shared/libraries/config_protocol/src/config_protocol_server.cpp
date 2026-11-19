@@ -734,13 +734,29 @@ void ConfigProtocolServer::setProtocolVersion(uint16_t protocolVersion)
 // threads that already hold such locks. So nothing here may make a reporting thread wait for the sender: the
 // queue lock is released before serializing, and a thread that finds another one sending leaves its events
 // queued for that sender, which keeps the events in order.
-void ConfigProtocolServer::SendOutCoreEvents()
+//
+// The thread finishing an RPC holds no component locks and has to send the events of the RPC before its reply,
+// so it passes waitForActiveSender and waits for the other sender instead of leaving.
+void ConfigProtocolServer::SendOutCoreEvents(bool waitForActiveSender)
 {
     std::unique_lock lock(coreEventsLock);
     if (sendingCoreEvents)
-        return;
+    {
+        // The sender can be this thread further up the stack, when the transport callback handles an RPC
+        if (!waitForActiveSender || coreEventsSender == std::this_thread::get_id())
+            return;
+
+        coreEventsSent.wait(lock, [this] { return !sendingCoreEvents; });
+    }
 
     sendingCoreEvents = true;
+    coreEventsSender = std::this_thread::get_id();
+    const auto finishSending = [this]
+    {
+        sendingCoreEvents = false;
+        coreEventsSent.notify_all();
+    };
+
     while (packedCoreEvents.getCount() > 0)
     {
         // sendNotification may throw an exception within the tests bcs client code called directly there, so first reset list of accumulated events before sending
@@ -755,12 +771,12 @@ void ConfigProtocolServer::SendOutCoreEvents()
         catch (...)
         {
             lock.lock();
-            sendingCoreEvents = false;
+            finishSending();
             throw;
         }
         lock.lock();
     }
-    sendingCoreEvents = false;
+    finishSending();
 }
 
 ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& configServerRef)
@@ -772,7 +788,7 @@ ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& con
 ConfigProtocolServer::RpcScopeTracker::~RpcScopeTracker()
 {
     this->configServerRef.activeRpcCounter.fetch_sub(1, std::memory_order_acq_rel);
-    this->configServerRef.SendOutCoreEvents();
+    this->configServerRef.SendOutCoreEvents(true);
 }
 
 SerializerPtr ConfigProtocolServer::createSerializer()

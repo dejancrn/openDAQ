@@ -22,6 +22,9 @@
 
 #include <opendaq/component_holder_ptr.h>
 #include <opendaq/client_type.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 namespace daq::config_protocol
 {
@@ -119,6 +122,8 @@ private:
     // Guards packedCoreEvents and sendingCoreEvents only; never held while serializing or sending
     std::mutex coreEventsLock;
     bool sendingCoreEvents{false};
+    std::thread::id coreEventsSender;
+    std::condition_variable coreEventsSent;
 
     PacketBuffer processPacketAndGetReply(const PacketBuffer& packetBuffer);
     void processNoReplyPacket(const PacketBuffer& packetBuffer);
@@ -149,7 +154,7 @@ private:
     CoreEventArgsPtr processCoreEventArgs(const CoreEventArgsPtr& args);
     CoreEventArgsPtr processUpdateEndCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args);
     CoreEventArgsPtr processAttributeChangedCoreEvent(const CoreEventArgsPtr& args);
-    void SendOutCoreEvents();
+    void SendOutCoreEvents(bool waitForActiveSender = false);
 };
 
 }
