@@ -27,6 +27,10 @@
 #include <opendaq/logger_sink_factory.h>
 #include <opendaq/logger_sink_last_message_private_ptr.h>
 #include <coreobjects/property_object_class_factory.h>
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <thread>
 
 using namespace daq;
 using namespace daq::config_protocol;
@@ -2093,4 +2097,46 @@ TEST_F(ConfigCoreEventTest, DeviceLockUnlock)
     ASSERT_FALSE(clSubDev.isLocked());
 
     ASSERT_EQ(callCount, 2);
+}
+
+// A thread reporting a core event usually holds component locks, and the thread sending the queued events takes
+// component locks to serialize them, so the reporting thread must never wait for the sending one
+TEST_F(ConfigCoreEventTest, CoreEventReportedWhileAnotherThreadIsSending)
+{
+    using namespace std::chrono_literals;
+
+    disconnected = true;
+
+    std::promise<void> sendStarted;
+    std::promise<void> secondEventReported;
+    auto secondEventReportedFuture = secondEventReported.get_future();
+    std::atomic<int> sendCount{0};
+    std::atomic<bool> reportedWhileSending{false};
+
+    const auto onNotification = [&](const PacketBuffer& /*packet*/)
+    {
+        if (sendCount++ == 0)
+        {
+            sendStarted.set_value();
+            reportedWhileSending = secondEventReportedFuture.wait_for(5s) == std::future_status::ready;
+        }
+    };
+
+    ConfigProtocolServer secondServer(
+        serverDevice, onNotification, User("", ""), ClientType::Control, test_utils::dummyExtSigFolder(serverDevice.getContext()));
+
+    const auto firstComponent = serverDevice.findComponent("IO/AI/Ch");
+    const auto secondComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+
+    std::thread sender([&] { firstComponent.setPropertyValue("StrProp", "foo"); });
+
+    const bool started = sendStarted.get_future().wait_for(10s) == std::future_status::ready;
+    if (started)
+        secondComponent.setDescription("reported while sending");
+    secondEventReported.set_value();
+    sender.join();
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(reportedWhileSending);
+    ASSERT_EQ(sendCount, 2);
 }

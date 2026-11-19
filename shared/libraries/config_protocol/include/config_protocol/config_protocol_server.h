@@ -107,9 +107,7 @@ private:
     ContextPtr daqContext;
     NotificationReadyCallback notificationReadyCallback;
     DeserializerPtr deserializer;
-    SerializerPtr notificationSerializer;
     std::unordered_map<std::string, DispatchFunction> rpcDispatch;
-    std::mutex notificationSerializerLock;
     std::unique_ptr<IComponentFinder> componentFinder;
     UserPtr user;
     ClientType connectionType;
@@ -118,7 +116,9 @@ private:
     ConfigProtocolStreamingConsumer streamingConsumer;
     std::atomic<uint64_t> activeRpcCounter{0};
     ListPtr<IBaseObject> packedCoreEvents;
+    // Guards packedCoreEvents and sendingCoreEvents only; never held while serializing or sending
     std::mutex coreEventsLock;
+    bool sendingCoreEvents{false};
 
     PacketBuffer processPacketAndGetReply(const PacketBuffer& packetBuffer);
     void processNoReplyPacket(const PacketBuffer& packetBuffer);

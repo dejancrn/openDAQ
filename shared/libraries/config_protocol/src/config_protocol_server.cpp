@@ -82,7 +82,6 @@ ConfigProtocolServer::ConfigProtocolServer(DevicePtr rootDevice,
     , daqContext(this->rootDevice.getContext())
     , notificationReadyCallback(std::move(notificationReadyCallback))
     , deserializer(JsonDeserializer())
-    , notificationSerializer(JsonSerializer())
     , componentFinder(std::make_unique<ComponentFinderRootDevice>(this->rootDevice))
     , user(user)
     , connectionType(connectionType)
@@ -92,7 +91,6 @@ ConfigProtocolServer::ConfigProtocolServer(DevicePtr rootDevice,
     , packedCoreEvents(List<IBaseObject>())
 {
     assert(user.assigned());
-    notificationSerializer.setUser(user);
 
     buildRpcDispatchStructure();
 
@@ -245,11 +243,13 @@ void ConfigProtocolServer::sendNotification(const BaseObjectPtr& obj)
     StringPtr jsonStr;
     try
     {
-        std::scoped_lock lock(notificationSerializerLock);
-        notificationSerializer.reset();
-        obj.serialize(notificationSerializer);
+        // Serializing takes the locks of the serialized components, so it uses its own serializer instead of
+        // a shared one behind a lock: a thread reporting a core event while holding such a component lock
+        // would otherwise wait for that lock and deadlock with the serializing thread
+        const auto serializer = createSerializer();
+        obj.serialize(serializer);
 
-        jsonStr = notificationSerializer.getOutput();
+        jsonStr = serializer.getOutput();
     }
     catch (const std::exception& e)
     {
@@ -680,12 +680,11 @@ CoreEventArgsPtr ConfigProtocolServer::processCoreEventArgs(const CoreEventArgsP
 
 CoreEventArgsPtr ConfigProtocolServer::processUpdateEndCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args)
 {
-    std::scoped_lock lock(notificationSerializerLock);
     auto dict = Dict<IString, IBaseObject>();
 
-    notificationSerializer.reset();
-    component.serialize(notificationSerializer);
-    dict.set("SerializedComponent", notificationSerializer.getOutput());
+    const auto serializer = createSerializer();
+    component.serialize(serializer);
+    dict.set("SerializedComponent", serializer.getOutput());
 
     return CoreEventArgs(static_cast<CoreEventId>(args.getEventId()), args.getEventName(), dict);
 }
@@ -729,24 +728,39 @@ uint16_t ConfigProtocolServer::getProtocolVersion() const
 void ConfigProtocolServer::setProtocolVersion(uint16_t protocolVersion)
 {
     this->protocolVersion = protocolVersion;
-
-    // downgrade serializers
-    if (protocolVersion < 11)
-    {
-        notificationSerializer = createSerializer();
-    }
 }
 
+// Serializing the queued events takes the locks of the components they carry, and core events are reported by
+// threads that already hold such locks. So nothing here may make a reporting thread wait for the sender: the
+// queue lock is released before serializing, and a thread that finds another one sending leaves its events
+// queued for that sender, which keeps the events in order.
 void ConfigProtocolServer::SendOutCoreEvents()
 {
-    std::scoped_lock lock(coreEventsLock);
-    if (packedCoreEvents.getCount() > 0)
+    std::unique_lock lock(coreEventsLock);
+    if (sendingCoreEvents)
+        return;
+
+    sendingCoreEvents = true;
+    while (packedCoreEvents.getCount() > 0)
     {
         // sendNotification may throw an exception within the tests bcs client code called directly there, so first reset list of accumulated events before sending
         ListPtr<IBaseObject> packedCoreEventsTmp = packedCoreEvents;
         packedCoreEvents = List<IBaseObject>();
-        sendNotification(packedCoreEventsTmp);
+
+        lock.unlock();
+        try
+        {
+            sendNotification(packedCoreEventsTmp);
+        }
+        catch (...)
+        {
+            lock.lock();
+            sendingCoreEvents = false;
+            throw;
+        }
+        lock.lock();
     }
+    sendingCoreEvents = false;
 }
 
 ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& configServerRef)
