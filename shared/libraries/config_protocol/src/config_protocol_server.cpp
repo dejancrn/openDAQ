@@ -581,24 +581,25 @@ bool ConfigProtocolServer::isForwardedCoreEvent(ComponentPtr& component, CoreEve
 }
 
 // Queues the event in the place it was reported in. While an RPC runs, from protocol version 20 on, the event is
-// left for a thread that finishes an RPC to serialize, which holds no component locks; otherwise the reporting
-// thread serializes it here, so a thread that holds component locks only ever serializes its own event.
+// left for a thread that finishes an RPC to serialize, which the native server does holding no component locks;
+// otherwise the reporting thread serializes it here, so a thread that holds component locks only ever
+// serializes its own event.
 void ConfigProtocolServer::packCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args)
 {
     PackedCoreEvent* packedEvent;
     {
         std::scoped_lock lock(coreEventsLock);
         packedEvent = &packedCoreEvents.emplace_back();
-        reportedCoreEventCount++;
     }
 
-    // Must not throw: the place of the event in the queue is released after it
-    const auto logExcludedCoreEvent = [this](const char* reason) noexcept
+    // Must not throw: the event is marked ready after it
+    const auto logExcludedCoreEvent = [this, &component, &args](const char* reason) noexcept
     {
         try
         {
             auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
-            LOG_W("A core event was excluded because preparing it failed: {}", reason);
+            const StringPtr globalId = component.assigned() ? component.getGlobalId() : "";
+            LOG_W("Component \"{}\" core event \"{}\" was excluded because preparing it failed: {}", globalId, args.getEventName(), reason);
         }
         catch (...)
         {
@@ -701,9 +702,21 @@ bool ConfigProtocolServer::prepareCoreEvent(const ComponentPtr& component,
 }
 
 // Returns the JSON of the two list items a core event is sent as, its global ID and its arguments, or an empty
-// string if serializing them fails
+// string if serializing them fails; does not throw
 std::string ConfigProtocolServer::serializeCoreEvent(const StringPtr& globalId, const CoreEventArgsPtr& packedArgs)
 {
+    const auto logExcludedCoreEvent = [this, &globalId, &packedArgs](const char* reason) noexcept
+    {
+        try
+        {
+            auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
+            LOG_W("Component \"{}\" core event \"{}\" was excluded because its serialization failed: {}", globalId, packedArgs.getEventName(), reason);
+        }
+        catch (...)
+        {
+        }
+    };
+
     try
     {
         // A list of the two items, written without the envelope a list object has from serializer version 2 on
@@ -718,14 +731,13 @@ std::string ConfigProtocolServer::serializeCoreEvent(const StringPtr& globalId, 
     }
     catch (const std::exception& e)
     {
-        auto loggerComponent = daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
-        LOG_W("Component \"{}\" core event \"{}\" was excluded because its serialization failed: {}", globalId, packedArgs.getEventName(), e.what());
-        return {};
+        logExcludedCoreEvent(e.what());
     }
     catch (...)
     {
-        return {};
+        logExcludedCoreEvent("unknown error");
     }
+    return {};
 }
 
 CoreEventArgsPtr ConfigProtocolServer::processCoreEventArgs(const CoreEventArgsPtr& args)
@@ -819,60 +831,64 @@ void ConfigProtocolServer::setProtocolVersion(uint16_t protocolVersion)
     this->protocolVersion = protocolVersion;
 }
 
-// Sends the queued core events from the front of the queue up to the first one that is not serialized yet. The
-// thread that finishes an RPC passes finishingRpc: it first serializes the deferred events and waits for the
-// other events reported so far, so that the events of the RPC are sent before its reply.
-void ConfigProtocolServer::SendOutCoreEvents(bool finishingRpc)
+void ConfigProtocolServer::SendOutCoreEvents()
+{
+    std::scoped_lock lock(coreEventsLock);
+    sendReadyCoreEvents();
+}
+
+// Called when an RPC ends. Serializes the deferred events, waits for the other events reported so far, and
+// sends them, so that the events of the RPC are sent before its reply.
+void ConfigProtocolServer::finishRpcCoreEvents()
 {
     std::unique_lock lock(coreEventsLock);
 
-    if (finishingRpc)
+    const auto reportedCount = sentCoreEventCount + packedCoreEvents.size();
+    for (;;)
     {
-        const auto reportedCount = reportedCoreEventCount;
-        for (;;)
+        std::vector<PackedCoreEvent*> deferredEvents;
+        bool allReady = true;
+        for (size_t i = 0; i < packedCoreEvents.size() && sentCoreEventCount + i < reportedCount; ++i)
         {
-            std::vector<PackedCoreEvent*> deferredEvents;
-            bool allReady = true;
-            for (size_t i = 0; i < packedCoreEvents.size() && sentCoreEventCount + i < reportedCount; ++i)
+            auto& packedEvent = packedCoreEvents[i];
+            if (packedEvent.state == PackedCoreEvent::State::Deferred)
             {
-                auto& packedEvent = packedCoreEvents[i];
-                if (packedEvent.state == PackedCoreEvent::State::Deferred)
-                {
-                    packedEvent.state = PackedCoreEvent::State::Serializing;
-                    deferredEvents.push_back(&packedEvent);
-                }
-                allReady = allReady && packedEvent.state == PackedCoreEvent::State::Ready;
+                deferredEvents.push_back(&packedEvent);
+                packedEvent.state = PackedCoreEvent::State::InProgress;
             }
-
-            if (allReady)
-                break;
-
-            if (deferredEvents.empty())
-            {
-                coreEventReady.wait(lock);
-                continue;
-            }
-
-            lock.unlock();
-            std::vector<std::string> jsons;
-            jsons.reserve(deferredEvents.size());
-            for (auto* packedEvent : deferredEvents)
-            {
-                const auto globalId = std::move(packedEvent->globalId);
-                const auto args = std::move(packedEvent->args);
-                jsons.push_back(serializeCoreEvent(globalId, args));
-            }
-            lock.lock();
-
-            for (size_t i = 0; i < deferredEvents.size(); ++i)
-            {
-                deferredEvents[i]->json = std::move(jsons[i]);
-                deferredEvents[i]->state = PackedCoreEvent::State::Ready;
-            }
-            coreEventReady.notify_all();
+            allReady = allReady && packedEvent.state == PackedCoreEvent::State::Ready;
         }
+
+        if (allReady)
+            break;
+
+        if (deferredEvents.empty())
+        {
+            coreEventReady.wait(lock);
+            continue;
+        }
+
+        lock.unlock();
+        for (auto* packedEvent : deferredEvents)
+        {
+            const auto globalId = std::move(packedEvent->globalId);
+            const auto args = std::move(packedEvent->args);
+            packedEvent->json = serializeCoreEvent(globalId, args);
+        }
+        lock.lock();
+
+        for (auto* packedEvent : deferredEvents)
+            packedEvent->state = PackedCoreEvent::State::Ready;
+        coreEventReady.notify_all();
     }
 
+    sendReadyCoreEvents();
+}
+
+// Sends the ready events from the front of the queue, up to the first one that is not ready, as one
+// notification. Called with coreEventsLock held.
+void ConfigProtocolServer::sendReadyCoreEvents()
+{
     std::string items;
     while (!packedCoreEvents.empty() && packedCoreEvents.front().state == PackedCoreEvent::State::Ready)
     {
@@ -909,7 +925,26 @@ ConfigProtocolServer::RpcScopeTracker::RpcScopeTracker(ConfigProtocolServer& con
 ConfigProtocolServer::RpcScopeTracker::~RpcScopeTracker()
 {
     this->configServerRef.activeRpcCounter.fetch_sub(1, std::memory_order_acq_rel);
-    this->configServerRef.SendOutCoreEvents(true);
+
+    // A destructor must not throw; the RPC itself has completed
+    try
+    {
+        this->configServerRef.finishRpcCoreEvents();
+    }
+    catch (const std::exception& e)
+    {
+        try
+        {
+            auto loggerComponent = this->configServerRef.daqContext.getLogger().getOrAddComponent("ConfigProtocolServer");
+            LOG_W("Sending the core events of an RPC failed: {}", e.what());
+        }
+        catch (...)
+        {
+        }
+    }
+    catch (...)
+    {
+    }
 }
 
 SerializerPtr ConfigProtocolServer::createSerializer()

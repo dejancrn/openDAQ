@@ -2114,6 +2114,9 @@ TEST_F(ConfigCoreEventTest, DeviceLockUnlock)
     ASSERT_EQ(callCount, 2);
 }
 
+namespace
+{
+
 // Runs the function when the test leaves its scope, also after a failed assertion or an exception
 struct OnExit
 {
@@ -2152,8 +2155,24 @@ private:
     std::function<void()> onSerialize;
 };
 
+// Fails to serialize
+class FailingSerializable : public ImplementationOf<ISerializable>
+{
+public:
+    ErrCode INTERFACE_FUNC serialize(ISerializer* /*serializer*/) override
+    {
+        return DAQ_MAKE_ERROR_INFO(OPENDAQ_ERR_GENERALERROR, "Fails to serialize");
+    }
+
+    ErrCode INTERFACE_FUNC getSerializeId(ConstCharPtr* id) const override
+    {
+        *id = "FailingSerializable";
+        return OPENDAQ_SUCCESS;
+    }
+};
+
 // Reports a core event of the component that carries the given object, on the calling thread
-static void reportCoreEventWith(const DevicePtr& device, const ComponentPtr& component, const ObjectPtr<ISerializable>& object)
+void reportCoreEventWith(const DevicePtr& device, const ComponentPtr& component, const ObjectPtr<ISerializable>& object)
 {
     EventPtr<const ComponentPtr, const CoreEventArgsPtr> coreEvent;
     checkErrorInfo(device.getContext()->getOnCoreEvent(&coreEvent));
@@ -2161,6 +2180,8 @@ static void reportCoreEventWith(const DevicePtr& device, const ComponentPtr& com
     const CoreEventArgsPtr args =
         CoreEventArgs(CoreEventId::StatusChanged, "StatusChanged", Dict<IString, IBaseObject>({{"Object", object}}));
     coreEvent(component, args);
+}
+
 }
 
 // The serialization of the first event waits, as it would for a component lock, until the second is reported
@@ -2217,9 +2238,12 @@ TEST_F(ConfigCoreEventTest, CoreEventReportedWhileAnotherThreadIsSerializing)
     ASSERT_LT(firstPos, secondPos);
 }
 
+namespace
+{
+
 // Runs an RPC while another thread is still serializing a core event it reported before, and returns whether
 // the event of the RPC had been sent when the RPC returned
-static bool rpcEventSentBeforeReply(std::function<void(const PacketBuffer&)>& notificationHook,
+bool rpcEventSentBeforeReply(std::function<void(const PacketBuffer&)>& notificationHook,
                                     const DevicePtr& serverDevice,
                                     const ComponentPtr& clientComponent)
 {
@@ -2263,6 +2287,8 @@ static bool rpcEventSentBeforeReply(std::function<void(const PacketBuffer&)>& no
     reporter.join();
 
     return sentBeforeReply;
+}
+
 }
 
 TEST_F(ConfigCoreEventTest, RpcSendsItsCoreEventsBeforeReplyWhileAnotherThreadIsSerializing)
@@ -2326,4 +2352,42 @@ TEST_F(ConfigCoreEventTest, CoreEventReportedDuringRpcIsSerializedByThreadFinish
     ASSERT_EQ(serializeCount, 1);
     ASSERT_NE(reportedBy, std::this_thread::get_id());
     ASSERT_EQ(serializedBy, std::this_thread::get_id());
+}
+
+TEST_F(ConfigCoreEventTest, CoreEventThatFailsToSerializeIsDroppedAlone)
+{
+    std::string sent;
+    OnExit clearHook{[this] { notificationHook = nullptr; }};
+    notificationHook = [&](const PacketBuffer& packet) { sent += packet.parseServerNotification().toStdString(); };
+
+    const auto serverComponent = serverDevice.findComponent("AdvancedPropertiesComponent");
+    const auto clientComponent = client->getDevice().findComponent("IO/AI/Ch");
+    const auto failing = createWithImplementation<ISerializable, FailingSerializable>();
+
+    // Reported with no RPC running, so serialized by this thread
+    const std::string firstMarker = "sent after the first failing event";
+    reportCoreEventWith(serverDevice, serverComponent, failing);
+    ASSERT_TRUE(sent.empty());
+    serverComponent.setDescription(firstMarker);
+    ASSERT_NE(sent.find(firstMarker), std::string::npos);
+
+    // Reported while an RPC runs, so serialized when the RPC finishes, with the event of the RPC
+    const std::string rpcMarker = "set by the rpc";
+    const auto active = std::make_shared<std::atomic<bool>>(true);
+    OnExit deactivate{[active] { *active = false; }};
+    std::atomic<bool> reported{false};
+    serverDevice.getContext().getOnCoreEvent() += [&, active](const ComponentPtr& /*comp*/, const CoreEventArgsPtr& args)
+    {
+        if (!*active || args.getEventId() != static_cast<Int>(CoreEventId::PropertyValueChanged) || reported.exchange(true))
+            return;
+
+        reportCoreEventWith(serverDevice, serverComponent, failing);
+    };
+
+    sent.clear();
+    clientComponent.setPropertyValue("StrProp", rpcMarker);
+
+    ASSERT_TRUE(reported);
+    ASSERT_NE(sent.find(rpcMarker), std::string::npos);
+    ASSERT_EQ(sent.find("FailingSerializable"), std::string::npos);
 }

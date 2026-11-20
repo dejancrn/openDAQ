@@ -120,28 +120,30 @@ private:
     ConfigProtocolStreamingConsumer streamingConsumer;
     std::atomic<uint64_t> activeRpcCounter{0};
 
-    // A core event in the queue, in the place it was reported in. A deferred event is serialized by the thread
-    // that finishes an RPC, any other by the thread that reported it. Empty JSON means the event is not sent.
+    // A core event in the queue, in the place it was reported in. While in progress, one thread prepares or
+    // serializes it and is the only one to use its fields; a deferred event waits for a thread that finishes an
+    // RPC to do that. Empty JSON means the event is not sent.
     struct PackedCoreEvent
     {
         enum class State
         {
-            Serializing,
+            InProgress,
             Deferred,
             Ready
         };
 
-        State state{State::Serializing};
+        State state{State::InProgress};
         StringPtr globalId;
         CoreEventArgsPtr args;
         std::string json;
     };
 
-    // Guards the queue and its counters; never held while an event is being serialized
+    // Guards the queue and the states of its events. Held while a batch is handed to the notification callback,
+    // never while an event is serialized. Only ready events at the front are removed, and a deque keeps
+    // references to its other elements valid, so a thread may keep a pointer to an event that is not ready.
     std::mutex coreEventsLock;
     std::condition_variable coreEventReady;
     std::deque<PackedCoreEvent> packedCoreEvents;
-    uint64_t reportedCoreEventCount{0};
     uint64_t sentCoreEventCount{0};
 
     PacketBuffer processPacketAndGetReply(const PacketBuffer& packetBuffer);
@@ -175,7 +177,9 @@ private:
     CoreEventArgsPtr processCoreEventArgs(const CoreEventArgsPtr& args);
     CoreEventArgsPtr processUpdateEndCoreEvent(const ComponentPtr& component, const CoreEventArgsPtr& args);
     CoreEventArgsPtr processAttributeChangedCoreEvent(const CoreEventArgsPtr& args);
-    void SendOutCoreEvents(bool finishingRpc = false);
+    void SendOutCoreEvents();
+    void finishRpcCoreEvents();
+    void sendReadyCoreEvents();
 };
 
 }
